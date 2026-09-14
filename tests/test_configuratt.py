@@ -562,7 +562,7 @@ def test_external_use_source_placement_error(tmp_path):
 
 
 def test_external_use_source_error_repeats(tmp_path):
-    """Source checking is memoized on success only: a bad source raises on every load."""
+    """A bad source keeps raising: sources are checked on every load, never remembered as good."""
     external = tmp_path / "external_repeat.yaml"
     external.write_text("other:\n  y: 2\nbase:\n  inner:\n    x: 1\n    _use: other\n")
     external_conf = OmegaConf.load(str(external))
@@ -609,3 +609,31 @@ def test_structured_use_source_accepted(tmp_path):
 
     assert conf.x == 1
     assert conf.y == 2
+
+
+def test_use_source_checked_on_cache_hit(tmp_path, monkeypatch):
+    """The top-level cache is keyed on path alone, so a cache hit must not skip the source check."""
+    monkeypatch.setattr("scabha.configuratt.cache.CACHEDIR", str(tmp_path / "cache"))
+
+    main = tmp_path / "main_cached.yaml"
+    main.write_text("_use: base\ntop: 1\n")
+
+    good = OmegaConf.create({"base": {"x": 1}})
+    configuratt.load(str(main), use_sources=[good], verbose=False, use_cache=True)
+
+    bad = OmegaConf.create({"other": {"y": 2}, "base": {"inner": {"x": 1, "_use": "other"}}})
+    with pytest.raises(ConfigurattError, match="base.inner"):
+        configuratt.load(str(main), use_sources=[bad], verbose=False, use_cache=True)
+
+
+def test_use_source_rechecked_after_mutation(tmp_path):
+    """A caller may keep filling a source in between loads, so each load checks it afresh."""
+    main = tmp_path / "main_mutated.yaml"
+    main.write_text("_use: base\ntop: 1\n")
+
+    source = OmegaConf.create({"base": {"x": 1}})
+    configuratt.load(str(main), use_sources=[source], verbose=False, use_cache=False)
+
+    source["base"]["inner"] = OmegaConf.create({"x": 1, "_use": "other"})
+    with pytest.raises(ConfigurattError, match="base.inner"):
+        configuratt.load(str(main), use_sources=[source], verbose=False, use_cache=False)

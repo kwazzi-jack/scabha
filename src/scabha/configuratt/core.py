@@ -3,7 +3,6 @@ import importlib.resources
 import os.path
 import re
 import uuid
-import weakref
 from collections.abc import Sequence
 from dataclasses import make_dataclass
 from typing import Any, Callable, List, Optional, Union
@@ -30,6 +29,7 @@ def load(
     no_toplevel_cache=False,
     include_stack=[],
     verbose: bool = False,
+    sources_validated: bool = False,
 ):
     """Loads config file, using a previously loaded config to resolve _use references.
 
@@ -45,12 +45,22 @@ def load(
         include_stack: list of paths which have been included. Used to catch recursive includes.
         include_path (str, optional):
             if set, path to each config file will be included in the section as element 'include_path'
+        sources_validated (bool, optional): if True, use_sources have already been placement-checked
+            by the caller, and are not checked again. Set by load_nested() when loading a batch of
+            files against one set of sources.
 
     Returns:
         Tuple of (conf, dependencies)
             conf (DictConfig): config object
             dependencies (ConfigDependencies): filenames that were _included
     """
+    name = name or os.path.basename(path)
+
+    # check sources before consulting the cache: the cache is keyed on path alone, so a cache hit
+    # would otherwise let a bad source through unexamined
+    if not sources_validated:
+        validate_use_sources(use_sources, name)
+
     use_toplevel_cache = use_cache and not no_toplevel_cache
     conf, dependencies = load_cache((path,), verbose=verbose) if use_toplevel_cache else (None, None)
 
@@ -72,10 +82,8 @@ def load(
         finally:
             OmegaConf.clear_resolver("self")
 
-        name = name or os.path.basename(path)
-        # validate directive placement here, while key order still reflects the file as written
+        # check placement here, while key order still reflects the file as written
         validate_directive_placement(subconf, location, name)
-        _validate_use_sources(use_sources, name)
         dependencies = ConfigDependencies()
         dependencies.add(path)
         # include ourself into sources, if _use is in effect, and we've enabled selfrefs
@@ -151,6 +159,9 @@ def load_nested(
     NameError
         If subsection name is not resolved
     """
+    # one check for the whole batch, rather than one per file against the same sources
+    validate_use_sources(use_sources, "config batch")
+
     section_content, dependencies = load_cache(filelist, verbose=verbose) if use_cache else (None, None)
 
     if section_content is None:
@@ -159,7 +170,13 @@ def load_nested(
 
         for path in filelist:
             # load file
-            subconf, deps = load(path, location=location, use_sources=use_sources, include_path=include_path)
+            subconf, deps = load(
+                path,
+                location=location,
+                use_sources=use_sources,
+                include_path=include_path,
+                sources_validated=True,
+            )
             dependencies.update(deps)
             if include_path:
                 subconf[include_path] = path
@@ -209,13 +226,15 @@ def _is_directive(key: str) -> bool:
 
 
 def validate_directive_placement(conf: Any, location: Optional[str], name: str):
-    """Checks placement of bare _include/_use and _include_post/_use_post directives in a config tree.
+    """Checks where _include/_use directives sit in each mapping of a config tree.
 
-    Bare directives must precede all content keys (lowest priority), _post directives must follow them
-    (highest priority); _include_<suffix>/_use_<suffix> may appear anywhere. Since position encodes
-    priority, this can only be judged on file content as written: once a mapping has been merged with
-    the content of an enclosing _include, key order in it is an artefact of that merge. So this runs on
-    freshly parsed files only, never on the merged configs produced by resolve_config_refs().
+    A directive's position sets its merge priority, so bare _include/_use must come before any content
+    key (lowest priority) and _include_post/_use_post after all of them (highest). The _<suffix> forms
+    take the priority of wherever they appear, so they are free to sit anywhere.
+
+    Only a freshly parsed file can be judged this way. Merging a mapping with the content of an
+    enclosing _include rewrites its key order, so the order seen after resolve_config_refs() says
+    nothing about what the author wrote - hence this runs at parse time and never on merged configs.
 
     Parameters
     ----------
@@ -231,9 +250,9 @@ def validate_directive_placement(conf: Any, location: Optional[str], name: str):
     ConfigurattError
         If a directive is placed where its priority would be ambiguous
     """
-    # a node can stand in for None, MISSING or an unresolved interpolation rather than for content,
-    # which is common in the structured configs a caller may pass as a _use source. Nothing to check
-    # in that case, and iterating one raises
+    # in a structured config (as stimela passes for _use), a node can stand in for None, MISSING or an
+    # unresolved interpolation instead of holding content. Those have no keys to check, and iterating
+    # one raises ConfigTypeError
     if isinstance(conf, (DictConfig, ListConfig)):
         if conf._is_none() or conf._is_missing() or conf._is_interpolation():
             return
@@ -265,25 +284,19 @@ def validate_directive_placement(conf: Any, location: Optional[str], name: str):
             validate_directive_placement(value, f"{location or ''}[{i}]", name)
 
 
-# Caller-supplied _use sources are placement-checked once per source object. Keyed by id() with the
-# source held weakly, so an entry disappears along with the source it refers to and its id can never
-# be matched against a later object: DictConfig hashes by content, which makes a set of configs
-# (and hence an ordinary memo) prohibitively expensive to probe.
-_validated_use_sources: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+def validate_use_sources(use_sources: Optional[List[DictConfig]], name: str):
+    """Checks directive placement in _use sources supplied by the caller.
 
+    Sources loaded via load() were checked when they were parsed, but a caller can also pass a config
+    it parsed itself (straight from OmegaConf.load(), or built with OmegaConf.structured()), and
+    nothing else in the loader ever looks at those.
 
-def _validate_use_sources(use_sources: Optional[List[DictConfig]], name: str):
-    """Internal helper: placement-checks _use sources supplied by the caller
-
-    Sources that came from load() were checked when they were parsed, but a caller may also pass
-    sections it parsed itself (straight from OmegaConf.load(), say), and those would otherwise never
-    be checked at all. Each source object is checked once, when it is first used.
+    Sources are re-checked on each top-level load rather than remembered, since a caller is free to
+    keep filling a source in between loads - stimela builds its config that way. Callers that load a
+    batch of files against one set of sources should check them once via load_nested() instead.
     """
     for source in use_sources or ():
-        if id(source) in _validated_use_sources:
-            continue
         validate_directive_placement(source, None, f"_use source supplied to {name}")
-        _validated_use_sources[id(source)] = source
 
 
 def resolve_config_refs(
